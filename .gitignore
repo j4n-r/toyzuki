@@ -1,0 +1,5 @@
+/target
+/bundle/rootfs
+/zig-out
+.zig-cache/
+alpine-minirootfs-3.24.1-x86_64.tar.gz

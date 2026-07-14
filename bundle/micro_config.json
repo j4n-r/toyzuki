@@ -1,0 +1,34 @@
+{
+  "ociVersion": "1.0.1",
+
+  "process": {
+    "args": ["/bin/sh"],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "cwd": "/"
+  },
+
+  "root": {
+    "path": "rootfs",
+    "readonly": false
+  },
+
+  "hostname": "mini-container",
+
+  "mounts": [
+    {
+      "destination": "/proc",
+      "type": "proc",
+      "source": "proc"
+    }
+  ],
+
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "uts" },
+      { "type": "mount" }
+    ]
+  }
+}
