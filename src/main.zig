@@ -1,32 +1,48 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const Config = struct {
-    ociVersion: []const u8,
-    process: Process,
-    hostname: []const u8,
-    linux: OCILinux,
-    mounts: []const OCIMounts,
-};
-
 const Context = struct {
     allocator: std.mem.Allocator,
     config: *const Config,
 };
 
-const Process = struct {
-    args: []const [:0]const u8,
-    env: []const [:0]const u8,
-    cwd: [:0]const u8,
+const Config = struct {
+    ociVersion: []const u8,
+    process: struct {
+        terminal: ?bool,
+        args: []const [:0]const u8,
+        env: []const [:0]const u8,
+        cwd: [:0]const u8,
+    },
+    hostname: []const u8,
+    root: struct {
+        path: ?[]const u8,
+        readonly: ?bool,
+    },
+    linux: struct {
+        namespaces: ?[]struct {
+            type: Namespaces,
+        },
+        cgroupsPath: ?[]const u8,
+        resources: ?Resource,
+    },
+    mounts: ?[]struct {
+        destination: [:0]const u8,
+        type: [:0]const u8,
+        source: [:0]const u8,
+        options: [][:0]const u8 = &.{},
+    },
 };
 
-const OCILinux = struct {
-    namespaces: []NamespaceType,
+const Resource = struct {
+    pids: ?struct { limit: u64 },
+    memory: ?struct { limit: u64 },
+    cpu: ?struct {
+        quota: u64,
+        period: u64,
+    },
 };
 
-const NamespaceType = struct {
-    type: Namespaces,
-};
 const Namespaces = enum {
     pid,
     mount,
@@ -38,10 +54,36 @@ const Namespaces = enum {
     time,
 };
 
-const OCIMounts = struct {
-    destination: [:0]const u8,
-    type: [:0]const u8,
-    source: [:0]const u8,
+pub const MountOption = struct {
+    name: []const u8,
+    clear: bool, // inverted option (e.g. "rw" clears MS_RDONLY)
+    flag: u32,
+};
+
+// Mirror of runc's mountFlags map (spec_linux.go:73)
+const mount_flags = [_]MountOption{
+    .{ .name = "async", .clear = true, .flag = linux.MS.SYNCHRONOUS },
+    .{ .name = "atime", .clear = true, .flag = linux.MS.NOATIME },
+    .{ .name = "bind", .clear = false, .flag = linux.MS.BIND },
+    .{ .name = "defaults", .clear = false, .flag = 0 },
+    .{ .name = "dev", .clear = true, .flag = linux.MS.NODEV },
+    .{ .name = "diratime", .clear = true, .flag = linux.MS.NODIRATIME },
+    .{ .name = "dirsync", .clear = false, .flag = linux.MS.DIRSYNC },
+    .{ .name = "exec", .clear = true, .flag = linux.MS.NOEXEC },
+    .{ .name = "noatime", .clear = false, .flag = linux.MS.NOATIME },
+    .{ .name = "nodev", .clear = false, .flag = linux.MS.NODEV },
+    .{ .name = "nodiratime", .clear = false, .flag = linux.MS.NODIRATIME },
+    .{ .name = "noexec", .clear = false, .flag = linux.MS.NOEXEC },
+    .{ .name = "nosuid", .clear = false, .flag = linux.MS.NOSUID },
+    .{ .name = "rbind", .clear = false, .flag = linux.MS.BIND | linux.MS.REC },
+    .{ .name = "relatime", .clear = false, .flag = linux.MS.RELATIME },
+    .{ .name = "remount", .clear = false, .flag = linux.MS.REMOUNT },
+    .{ .name = "ro", .clear = false, .flag = linux.MS.RDONLY },
+    .{ .name = "rw", .clear = true, .flag = linux.MS.RDONLY },
+    .{ .name = "silent", .clear = false, .flag = linux.MS.SILENT },
+    .{ .name = "strictatime", .clear = false, .flag = linux.MS.STRICTATIME },
+    .{ .name = "suid", .clear = true, .flag = linux.MS.NOSUID },
+    .{ .name = "sync", .clear = false, .flag = linux.MS.SYNCHRONOUS },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -68,14 +110,30 @@ pub fn main(init: std.process.Init) !void {
 
     defer allocator.free(file_contents);
 
-    const parsed_config = try std.json.parseFromSlice(
+    var scanner = std.json.Scanner.initCompleteInput(allocator, file_contents);
+    defer scanner.deinit();
+
+    var diagnostics: std.json.Diagnostics = .{};
+    scanner.enableDiagnostics(&diagnostics);
+
+    const parsed_config = std.json.parseFromTokenSource(
         Config,
         arena,
-        file_contents,
-        .{
-            .ignore_unknown_fields = true,
-        },
-    );
+        &scanner,
+        .{},
+    ) catch |err| {
+        std.debug.print(
+            "JSON error: {s} at {d}:{d}, byte {d}\n",
+            .{
+                @errorName(err),
+                diagnostics.getLine(),
+                diagnostics.getColumn(),
+                diagnostics.getByteOffset(),
+            },
+        );
+        return err;
+    };
+
     std.debug.print("{any}\n", .{parsed_config.value});
 
     try run(parsed_config.value, arena);
@@ -84,6 +142,10 @@ pub fn main(init: std.process.Init) !void {
 fn child(child_args: usize) callconv(.c) u8 {
     const context: *Context = @ptrFromInt(child_args);
     const config = context.config;
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    defer threaded.deinit();
+    const io = threaded.io();
 
     const hostname = "container";
     const sethostname_result = linux.syscall2(.sethostname, @intFromPtr(hostname), hostname.len);
@@ -102,36 +164,130 @@ fn child(child_args: usize) callconv(.c) u8 {
 
     const chdir_result = linux.chdir(config.process.cwd);
     const chdir_err = linux.errno(chdir_result);
-    if (chroot_err != .SUCCESS) {
+    if (chdir_err != .SUCCESS) {
         std.debug.print("chdir failed: {t}", .{chdir_err});
         return 1;
     }
 
-    for (config.mounts) |mount| {
-        std.debug.print(
-            "Mount {s} -> {s} with type: {s}\n",
-            .{
-                mount.source,
-                mount.destination,
-                mount.type,
-            },
-        );
-
-        const mount_result = linux.mount(mount.source, mount.destination, mount.type, 0, 0);
-        const mount_err = linux.errno(mount_result);
-        if (mount_err != .SUCCESS) {
+    if (config.mounts) |mounts| {
+        for (mounts) |mount| {
             std.debug.print(
-                "Mount {s} -> {s} failed: {s}\n",
+                "Trying to Mount {s} -> {s} with type: {s}\n",
                 .{
                     mount.source,
                     mount.destination,
-                    @tagName(chroot_err),
+                    mount.type,
                 },
             );
-            return 1;
+
+            const dir = std.Io.Dir.cwd();
+            std.Io.Dir.createDirPath(dir, io, mount.destination) catch {
+                return 1;
+            };
+
+            var flags: u32 = 0;
+            for (mount.options) |option| {
+                for (mount_flags) |candidate| {
+                    if (std.mem.eql(u8, option, candidate.name)) {
+                        if (candidate.clear) {
+                            flags &= ~candidate.flag;
+                        } else {
+                            flags |= candidate.flag;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            const mount_result = linux.mount(mount.source, mount.destination, mount.type, flags, 0);
+            const mount_err = linux.errno(mount_result);
+            if (mount_err != .SUCCESS) {
+                std.debug.print(
+                    "Mount {s} -> {s} failed: {s}\n",
+                    .{
+                        mount.source,
+                        mount.destination,
+                        @tagName(mount_err),
+                    },
+                );
+                return 1;
+            }
         }
     }
 
+    const dir = std.Io.Dir.cwd();
+    std.Io.Dir.createDirPath(dir, io, "/sys/fs/cgroup/container") catch |err| {
+        std.debug.print("Create cgroup path failed: {s}", .{@errorName(err)});
+        return 1;
+    };
+
+    const cgroup_dir = std.Io.Dir.openDirAbsolute(io, "/sys/fs/cgroup/container", .{}) catch |err| {
+        std.debug.print("ERR: {s}", .{@errorName(err)});
+        return 1;
+    };
+
+    if (config.linux.resources) |resources| {
+        if (resources.cpu) |cpu| {
+            const content = std.fmt.allocPrint(
+                context.allocator,
+                "{d} {d}\n",
+                .{ cpu.quota, cpu.period },
+            ) catch |err| {
+                std.debug.print("ERR: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            defer context.allocator.free(content);
+
+            cgroup_dir.writeFile(io, .{
+                .sub_path = "cpu.max",
+                .data = content,
+                .flags = .{},
+            }) catch |err| {
+                std.debug.print("ERR: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+        }
+        if (resources.memory) |memory| {
+            const content = std.fmt.allocPrint(
+                context.allocator,
+                "{d}\n",
+                .{memory.limit},
+            ) catch |err| {
+                std.debug.print("ERR: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            defer context.allocator.free(content);
+
+            cgroup_dir.writeFile(io, .{
+                .sub_path = "memory.max",
+                .data = content,
+                .flags = .{},
+            }) catch |err| {
+                std.debug.print("ERR: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+        }
+        if (resources.pids) |pids| {
+            const content = std.fmt.allocPrint(
+                context.allocator,
+                "{d}\n",
+                .{pids.limit},
+            ) catch |err| {
+                std.debug.print("ERR: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            defer context.allocator.free(content);
+
+            cgroup_dir.writeFile(io, .{
+                .sub_path = "pids.max",
+                .data = content,
+                .flags = .{},
+            }) catch |err| {
+                std.debug.print("ERR: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+        }
+    }
     const argv = makeCStringVector(config.process.args, context.allocator) catch |err| {
         std.log.err("makeCStringVector(argv) failed: {}", .{err});
         return 1;
@@ -169,18 +325,19 @@ fn run(config: Config, allocator: std.mem.Allocator) !void {
     const stack = try allocator.alignedAlloc(u8, std.mem.Alignment.@"16", 1024 * 1024);
     defer allocator.free(stack);
 
-    var flags: u32 = @intFromEnum(linux.SIG.CHLD);
-
-    for (config.linux.namespaces) |namespace| {
-        switch (namespace.type) {
-            .pid => flags |= linux.CLONE.NEWPID,
-            .mount => flags |= linux.CLONE.NEWNS,
-            .network => flags |= linux.CLONE.NEWNET,
-            .uts => flags |= linux.CLONE.NEWUTS,
-            .user => flags |= linux.CLONE.NEWUSER,
-            .cgroup => flags |= linux.CLONE.NEWCGROUP,
-            .ipc => flags |= linux.CLONE.NEWIPC,
-            .time => flags |= linux.CLONE.NEWTIME,
+    var flags: u32 = @backingInt(linux.SIG.CHLD);
+    if (config.linux.namespaces) |namespaces| {
+        for (namespaces) |namespace| {
+            switch (namespace.type) {
+                .pid => flags |= linux.CLONE.NEWPID,
+                .mount => flags |= linux.CLONE.NEWNS,
+                .network => flags |= linux.CLONE.NEWNET,
+                .uts => flags |= linux.CLONE.NEWUTS,
+                .user => flags |= linux.CLONE.NEWUSER,
+                .cgroup => flags |= linux.CLONE.NEWCGROUP,
+                .ipc => flags |= linux.CLONE.NEWIPC,
+                .time => flags |= linux.CLONE.NEWTIME,
+            }
         }
     }
     const stack_top = @intFromPtr(stack.ptr) + stack.len;

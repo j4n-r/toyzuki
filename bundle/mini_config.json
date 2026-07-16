@@ -68,7 +68,7 @@
       "options": [
         "nosuid",
         "noexec",
-        "nodev",
+        "Nodev",
         "ro"
       ]
     }
